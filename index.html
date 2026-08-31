@@ -144,7 +144,10 @@
     width:6px;height:12px;border:solid #fff;border-width:0 2.5px 2.5px 0;
     transform:rotate(43deg);
   }
-  .hit{padding:9px;margin:-9px}
+  /* 보이는 네모는 26px로 두고, 누를 수 있는 범위만 44px로 넓힌다.
+     (padding으로는 안 된다. box-sizing:border-box + width:26px이라
+      padding은 영역을 넓히는 대신 안쪽만 깎는다.) */
+  .box::before{content:"";position:absolute;left:-9px;top:-9px;right:-9px;bottom:-9px}
   .main{flex:1;min-width:0}
   .title{font-size:16.5px;overflow-wrap:anywhere}
   .item.checked .title{color:var(--done);text-decoration:line-through}
@@ -911,7 +914,7 @@
       attachDrag(li, it);
     }
 
-    var box = el("button", "box hit");
+    var box = el("button", "box");
     box.setAttribute("role", "checkbox");
     box.setAttribute("aria-checked", o.checked ? "true" : "false");
     box.setAttribute("aria-label", it.title);
