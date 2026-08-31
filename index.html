@@ -292,6 +292,26 @@
   .panel .hint{color:var(--muted);font-size:13.5px;margin-top:12px;line-height:1.6}
   .panel input[type=number]{font:inherit;width:70px;border:1px solid var(--line);border-radius:6px;padding:6px 8px}
 
+  /* ===== 동기화 ===== */
+  .synctag{
+    font-size:13px;padding:4px 11px;border-radius:999px;white-space:nowrap;
+    background:var(--line-soft);color:var(--muted);
+  }
+  .synctag.ok{background:var(--good-bg);color:#177a4b}
+  .synctag.off{background:var(--line-soft);color:var(--muted)}
+  .synctag.err{background:var(--alert-bg);color:var(--alert)}
+  .synctag.busy{background:var(--accent-bg);color:var(--accent)}
+  .cloudform{display:flex;flex-direction:column;gap:10px;max-width:340px}
+  .cloudform input{
+    font:inherit;font-size:16px;border:1px solid var(--line);border-radius:8px;
+    padding:10px 12px;background:var(--card);color:var(--ink);width:100%;
+  }
+  .cloudform input.code{letter-spacing:.4em;font-size:20px;text-align:center}
+  .cloudform .btn{align-self:flex-start}
+  .cloudmsg{font-size:14px;margin-top:4px}
+  .cloudmsg.bad{color:var(--alert)}
+  .cloudmsg.good{color:#177a4b}
+
   footer{margin-top:34px;font-size:13px;color:var(--muted);line-height:1.7}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
@@ -322,6 +342,7 @@
     <div class="headline">
       <h1>오늘 가게 할 일</h1>
       <span class="late" id="lateChip" hidden></span>
+      <span class="synctag" id="syncTag" hidden></span>
     </div>
     <div class="progress" id="progressWrap">
       <div class="progress-top"><span>매일 하는 일</span><span id="progressText"></span></div>
@@ -390,6 +411,7 @@
   <div class="tools">
     <button class="link" id="openSettings">설정</button>
     <button class="link" id="openCats">카테고리 관리</button>
+    <button class="link" id="openCloud" hidden>클라우드 동기화</button>
     <button class="link" id="doPrint">인쇄</button>
     <button class="link" id="doExport">백업 파일로 저장</button>
     <button class="link" id="doImport">백업 불러오기</button>
@@ -398,6 +420,7 @@
   </div>
   <div class="panel" id="settingsPanel" hidden></div>
   <div class="panel" id="catPanel" hidden></div>
+  <div class="panel" id="cloudPanel" hidden></div>
 
   <footer id="foot"></footer>
 </div>
@@ -521,6 +544,8 @@
       storageOK = false;
       renderAlarms();
     }
+    // 로컬 저장이 끝난 뒤에 클라우드로 보낸다. 실패해도 로컬은 이미 안전하다.
+    if(typeof schedulePush === "function") schedulePush();
   }
 
   function pruneHistory(){
@@ -707,7 +732,9 @@
     if(tab === "report") renderReport();
     if(!$("settingsPanel").hidden) renderSettings();
     if(!$("catPanel").hidden) renderCats();
+    if(!$("cloudPanel").hidden) renderCloud();
     $("doUndo").hidden = !hasUndo();
+    renderSyncTag();
     renderFoot();
   }
 
@@ -1561,6 +1588,430 @@
     try { return !!localStorage.getItem(UNDO_KEY); } catch(e){ return false; }
   }
 
+  /* ================= 클라우드 동기화 =================
+     설계 원칙: localStorage가 항상 진짜다. 클라우드는 거들 뿐이다.
+     인터넷이 끊겨도 앱은 평소처럼 돌아가고, 연결되면 알아서 맞춘다.
+     ================================================== */
+
+  // 사장님의 Supabase 프로젝트 값. 둘 다 공개돼도 되는 값이고,
+  // 실제 데이터는 서버의 보안 규칙(RLS)이 막는다. 자세한 건 클라우드설정.md 참고.
+  var CLOUD_URL = "";
+  var CLOUD_KEY = "";
+
+  var AUTH_KEY  = "gagecheck.auth";
+  var CONFLICT_KEY = "gagecheck.v1.beforesync";
+  var POLL_MS = 10000;
+
+  var auth = null;          // {access_token, refresh_token, expires_at, email, user_id}
+  var syncState = "off";    // off | 로그인필요 | 동기화됨 | 보내는중 | 오프라인 | 충돌 | 오류
+  var syncedAt = null;      // 마지막으로 맞춘 시각
+  var localRev = 0;         // 우리가 알고 있는 서버 rev
+  var pushTimer = null;
+  var pollTimer = null;
+  var pulling = false;
+
+  function cloudConfigured(){ return !!(CLOUD_URL && CLOUD_KEY); }
+
+  function loadAuth(){
+    try { auth = JSON.parse(localStorage.getItem(AUTH_KEY) || "null"); }
+    catch(e){ auth = null; }
+  }
+  function saveAuth(){
+    try {
+      if(auth) localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+      else localStorage.removeItem(AUTH_KEY);
+    } catch(e){}
+  }
+
+  function setSync(s){
+    if(syncState === s) return;
+    syncState = s;
+    renderSyncTag();
+    // 열려 있는 패널의 상태 줄도 같이 갱신한다.
+    // 로그인 전에는 입력 중인 칸이 날아가므로 건드리지 않는다.
+    if(auth && !$("cloudPanel").hidden) renderCloud();
+  }
+
+  function renderSyncTag(){
+    var tag = $("syncTag");
+    if(!cloudConfigured()){ tag.hidden = true; return; }
+    tag.hidden = false;
+
+    var label = {
+      "로그인필요": "동기화 꺼짐",
+      "동기화됨": "동기화됨",
+      "보내는중": "저장 중…",
+      "오프라인": "오프라인",
+      "충돌": "확인 필요",
+      "오류": "동기화 오류"
+    }[syncState] || "동기화 꺼짐";
+
+    var cls = "synctag ";
+    if(syncState === "동기화됨") cls += "ok";
+    else if(syncState === "보내는중") cls += "busy";
+    else if(syncState === "충돌" || syncState === "오류") cls += "err";
+    else cls += "off";
+
+    tag.className = cls;
+    tag.textContent = label;
+    tag.title = syncedAt ? "마지막 동기화 " + timeAgo(syncedAt) : "";
+  }
+
+  function timeAgo(t){
+    var s = Math.floor((Date.now() - t) / 1000);
+    if(s < 60) return "방금";
+    if(s < 3600) return Math.floor(s/60) + "분 전";
+    if(s < 86400) return Math.floor(s/3600) + "시간 전";
+    return Math.floor(s/86400) + "일 전";
+  }
+
+  /* ---- 통신 ---- */
+
+  function authHeaders(){
+    return {
+      "apikey": CLOUD_KEY,
+      "Authorization": "Bearer " + (auth ? auth.access_token : CLOUD_KEY),
+      "Content-Type": "application/json"
+    };
+  }
+
+  function refreshToken(){
+    if(!auth || !auth.refresh_token) return Promise.reject(new Error("no refresh"));
+    return fetch(CLOUD_URL + "/auth/v1/token?grant_type=refresh_token", {
+      method:"POST",
+      headers:{ "apikey":CLOUD_KEY, "Content-Type":"application/json" },
+      body: JSON.stringify({ refresh_token: auth.refresh_token })
+    }).then(function(r){
+      if(!r.ok) throw new Error("refresh 실패");
+      return r.json();
+    }).then(function(d){
+      auth.access_token = d.access_token;
+      auth.refresh_token = d.refresh_token;
+      auth.expires_at = Date.now() + (d.expires_in || 3600) * 1000;
+      saveAuth();
+    });
+  }
+
+  // 만료가 가까우면 먼저 갱신한다.
+  function ensureToken(){
+    if(!auth) return Promise.reject(new Error("로그인 안 됨"));
+    if(auth.expires_at && auth.expires_at - Date.now() > 60000) return Promise.resolve();
+    return refreshToken();
+  }
+
+  function rest(path, opts){
+    return ensureToken().then(function(){
+      var o = opts || {};
+      o.headers = Object.assign({}, authHeaders(), o.headers || {});
+      return fetch(CLOUD_URL + "/rest/v1/" + path, o);
+    });
+  }
+
+  /* ---- 로그인 ---- */
+
+  function sendCode(email){
+    return fetch(CLOUD_URL + "/auth/v1/otp", {
+      method:"POST",
+      headers:{ "apikey":CLOUD_KEY, "Content-Type":"application/json" },
+      body: JSON.stringify({ email: email, create_user: true })
+    }).then(function(r){
+      if(!r.ok) return r.json().then(function(e){
+        throw new Error(e.msg || e.error_description || "코드를 보내지 못했습니다");
+      });
+      return true;
+    });
+  }
+
+  function verifyCode(email, code){
+    return fetch(CLOUD_URL + "/auth/v1/verify", {
+      method:"POST",
+      headers:{ "apikey":CLOUD_KEY, "Content-Type":"application/json" },
+      body: JSON.stringify({ type:"email", email: email, token: code })
+    }).then(function(r){
+      if(!r.ok) return r.json().then(function(e){
+        throw new Error(e.msg || e.error_description || "코드가 맞지 않습니다");
+      });
+      return r.json();
+    }).then(function(d){
+      auth = {
+        access_token: d.access_token,
+        refresh_token: d.refresh_token,
+        expires_at: Date.now() + (d.expires_in || 3600) * 1000,
+        email: email,
+        user_id: d.user && d.user.id
+      };
+      saveAuth();
+    });
+  }
+
+  function signOut(){
+    auth = null;
+    localRev = 0;
+    syncedAt = null;
+    saveAuth();
+    stopPolling();
+    setSync("로그인필요");
+    renderCloud();
+  }
+
+  /* ---- 주고받기 ---- */
+
+  function pull(){
+    if(!auth || pulling) return Promise.resolve();
+    pulling = true;
+
+    return rest("shop_state?select=data,rev,updated_at,device&limit=1")
+      .then(function(r){
+        if(!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function(rows){
+        syncedAt = Date.now();
+
+        if(!rows.length){
+          // 서버가 비어 있다. 지금 내용을 처음 올린다.
+          return firstPush();
+        }
+
+        var row = rows[0];
+        if(row.rev === localRev){ setSync("동기화됨"); return; }
+
+        // 서버가 우리가 아는 것보다 앞서 있다 → 받아온다.
+        // 지금 화면 내용은 되돌릴 수 있게 따로 보관해 둔다.
+        try { localStorage.setItem(CONFLICT_KEY, JSON.stringify(state)); } catch(e){}
+
+        state = normalize(row.data);
+        localRev = row.rev;
+        openId = null; calPicked = null;
+        ensureTodayRecorded();
+        save();
+        setSync("동기화됨");
+        render();
+        notifyPulled(row.device);
+      })
+      .catch(function(e){
+        setSync(navigator.onLine ? "오류" : "오프라인");
+      })
+      .then(function(){ pulling = false; });
+  }
+
+  function firstPush(){
+    return rest("shop_state", {
+      method:"POST",
+      headers:{ "Prefer":"return=representation" },
+      body: JSON.stringify({
+        user_id: auth.user_id, data: state, rev: 1, device: deviceName()
+      })
+    }).then(function(r){
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function(rows){
+      localRev = (rows[0] && rows[0].rev) || 1;
+      syncedAt = Date.now();
+      setSync("동기화됨");
+    });
+  }
+
+  function pushNow(){
+    if(!auth) return Promise.resolve();
+    setSync("보내는중");
+
+    // rev가 우리가 아는 값일 때만 덮어쓴다. 그 사이 다른 기기가 바꿨으면
+    // 0줄이 돌아오고, 그때는 덮어쓰지 않고 받아온다.
+    return rest("shop_state?user_id=eq." + auth.user_id + "&rev=eq." + localRev, {
+      method:"PATCH",
+      headers:{ "Prefer":"return=representation" },
+      body: JSON.stringify({
+        data: state, rev: localRev + 1,
+        updated_at: new Date().toISOString(), device: deviceName()
+      })
+    }).then(function(r){
+      if(!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    }).then(function(rows){
+      if(!rows.length){
+        // 다른 기기가 먼저 바꿨다.
+        return pull();
+      }
+      localRev = rows[0].rev;
+      syncedAt = Date.now();
+      setSync("동기화됨");
+    }).catch(function(e){
+      setSync(navigator.onLine ? "오류" : "오프라인");
+    });
+  }
+
+  function schedulePush(){
+    if(!cloudConfigured() || !auth) return;
+    setSync("보내는중");
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushNow, 1200);   // 연속 클릭을 한 번으로 묶는다
+  }
+
+  function deviceName(){
+    var ua = navigator.userAgent;
+    if(/Android|iPhone|iPad|Mobile/i.test(ua)) return "폰";
+    return "PC";
+  }
+
+  function notifyPulled(device){
+    var box = $("alarms");
+    var msg = (device && device !== deviceName())
+      ? device + "에서 바뀐 내용을 받아왔습니다."
+      : "다른 기기에서 바뀐 내용을 받아왔습니다.";
+    box.appendChild(alarmBox("soft", msg, "이 기기 내용으로 되돌리기", restoreBeforeSync));
+  }
+
+  function restoreBeforeSync(){
+    var raw;
+    try { raw = localStorage.getItem(CONFLICT_KEY); } catch(e){ return; }
+    if(!raw) return;
+    if(!confirm("받아온 내용을 버리고, 이 기기에 있던 내용으로 되돌릴까요?\n되돌린 내용이 다른 기기에도 반영됩니다.")) return;
+    try { state = normalize(JSON.parse(raw)); } catch(e){ alert("되돌리지 못했습니다."); return; }
+    try { localStorage.removeItem(CONFLICT_KEY); } catch(e){}
+    save();
+    pushNow().then(render);
+    render();
+  }
+
+  /* ---- 주기적으로 확인 ---- */
+
+  function startPolling(){
+    stopPolling();
+    if(!cloudConfigured() || !auth) return;
+    pollTimer = setInterval(function(){
+      if(document.hidden) return;          // 안 보고 있으면 쉬게 둔다
+      pull();
+    }, POLL_MS);
+  }
+  function stopPolling(){
+    if(pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  /* ---- 설정 화면 ---- */
+
+  var pendingEmail = null;
+
+  function renderCloud(){
+    var p = $("cloudPanel");
+    p.innerHTML = "<h2>클라우드 동기화</h2>";
+
+    if(!cloudConfigured()){
+      p.appendChild(el("div", "hint",
+        "아직 연결되지 않았습니다. 클라우드설정.md 문서를 따라 Supabase 주소와 키를 넣으면 켜집니다."));
+      return;
+    }
+
+    if(auth){
+      var r1 = el("div", "row2");
+      r1.appendChild(el("span", "name", auth.email));
+      var out = el("button", "mini", "로그아웃");
+      out.onclick = function(){
+        if(confirm("이 기기에서 로그아웃할까요?\n적어둔 내용은 이 기기에 그대로 남습니다.")) signOut();
+      };
+      r1.appendChild(out);
+      p.appendChild(r1);
+
+      var r2 = el("div", "row2");
+      r2.appendChild(el("span", "name", "상태"));
+      r2.appendChild(el("span", null,
+        syncState + (syncedAt ? "  ·  " + timeAgo(syncedAt) : "")));
+      p.appendChild(r2);
+
+      var r3 = el("div", "row2");
+      var now = el("button", "mini", "지금 맞추기");
+      now.onclick = function(){ pull().then(renderCloud); };
+      r3.appendChild(now);
+      p.appendChild(r3);
+
+      p.appendChild(el("div", "hint",
+        "다른 기기에서도 같은 이메일로 로그인하면 같은 목록이 보입니다. " +
+        "인터넷이 끊겨도 앱은 그대로 쓰이고, 연결되면 알아서 맞춰집니다."));
+      return;
+    }
+
+    // 로그인 전
+    var form = el("div", "cloudform");
+    var msg = el("div", "cloudmsg");
+
+    if(!pendingEmail){
+      var email = document.createElement("input");
+      email.type = "email";
+      email.placeholder = "이메일 주소";
+      email.autocomplete = "email";
+      form.appendChild(email);
+
+      var send = el("button", "btn primary", "코드 받기");
+      send.style.marginLeft = "0";
+      send.onclick = function(){
+        var v = email.value.trim();
+        if(!v){ email.focus(); return; }
+        send.disabled = true; send.textContent = "보내는 중…";
+        sendCode(v).then(function(){
+          pendingEmail = v;
+          renderCloud();
+        }).catch(function(e){
+          send.disabled = false; send.textContent = "코드 받기";
+          msg.className = "cloudmsg bad";
+          msg.textContent = e.message;
+        });
+      };
+      form.appendChild(send);
+      form.appendChild(msg);
+      p.appendChild(form);
+      p.appendChild(el("div", "hint",
+        "이메일로 6자리 숫자가 옵니다. 비밀번호는 따로 없습니다."));
+      return;
+    }
+
+    msg.className = "cloudmsg good";
+    msg.textContent = pendingEmail + " 으로 6자리 숫자를 보냈습니다.";
+    form.appendChild(msg);
+
+    var code = document.createElement("input");
+    code.type = "text";
+    code.className = "code";
+    code.inputMode = "numeric";
+    code.maxLength = 6;
+    code.placeholder = "······";
+    form.appendChild(code);
+
+    var err = el("div", "cloudmsg bad");
+
+    var ok = el("button", "btn primary", "확인");
+    ok.style.marginLeft = "0";
+    ok.onclick = function(){
+      var v = code.value.trim();
+      if(v.length < 6){ code.focus(); return; }
+      ok.disabled = true; ok.textContent = "확인 중…";
+      verifyCode(pendingEmail, v).then(function(){
+        pendingEmail = null;
+        renderCloud();
+        startSync();
+      }).catch(function(e){
+        ok.disabled = false; ok.textContent = "확인";
+        err.textContent = e.message;
+      });
+    };
+    form.appendChild(ok);
+    form.appendChild(err);
+
+    var again = el("button", "link", "다른 이메일로 다시 하기");
+    again.style.marginTop = "6px";
+    again.onclick = function(){ pendingEmail = null; renderCloud(); };
+    form.appendChild(again);
+
+    p.appendChild(form);
+    setTimeout(function(){ code.focus(); }, 50);
+  }
+
+  function startSync(){
+    if(!cloudConfigured()){ setSync("off"); return; }
+    $("openCloud").hidden = false;
+    if(!auth){ setSync("로그인필요"); return; }
+    pull().then(startPolling);
+  }
+
   /* ---------------- 연결 ---------------- */
 
   $("addBtn").onclick = addItem;
@@ -1597,8 +2048,20 @@
   $("openCats").onclick = function(){
     var p = $("catPanel");
     p.hidden = !p.hidden;
-    if(!p.hidden){ $("settingsPanel").hidden = true; renderCats(); }
+    if(!p.hidden){ $("settingsPanel").hidden = true; $("cloudPanel").hidden = true; renderCats(); }
   };
+  $("openCloud").onclick = function(){
+    var p = $("cloudPanel");
+    p.hidden = !p.hidden;
+    if(!p.hidden){ $("settingsPanel").hidden = true; $("catPanel").hidden = true; renderCloud(); }
+  };
+
+  // 창을 다시 보거나 인터넷이 돌아오면 곧바로 한 번 맞춘다.
+  document.addEventListener("visibilitychange", function(){
+    if(!document.hidden && auth) pull();
+  });
+  window.addEventListener("online", function(){ if(auth) pull(); });
+  window.addEventListener("offline", function(){ setSync("오프라인"); });
 
   $("doPrint").onclick = function(){
     tab = "today"; openId = null; showDone = false;
@@ -1630,8 +2093,11 @@
 
   setType("routine");
   ensureTodayRecorded();
+  loadAuth();
   save();          // 첫 실행이면 초기 데이터를, v1이었다면 변환 결과를 여기서 굳힌다
   render();
+  renderSyncTag();
+  startSync();
   $("newTitle").focus();
 })();
 </script>
