@@ -1,0 +1,21 @@
+# 사장님 실제 가게 데이터 — 절대 커밋하지 않는다.
+# '백업 파일로 저장'으로 받은 파일이 프로젝트 폴더에 놓일 수 있다.
+가게체크_*.json
+gagecheck_*.json
+
+# 개인 설정 (launch.json은 팀 공용이라 커밋한다)
+.claude/settings.local.json
+
+# 편집기
+.vscode/
+.idea/
+*.swp
+
+# 윈도우 / macOS 탐색기 부산물
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 임시 파일
+*.tmp
+*~
