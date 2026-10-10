@@ -1,0 +1,7 @@
+# Vercel 에 올리지 않을 파일 (정적 사이트는 올린 파일이 모두 공개된다)
+.env*
+.vercel
+.claude
+.vscode
+가게체크_*.json
+gagecheck_*.json

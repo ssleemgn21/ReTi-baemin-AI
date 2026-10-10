@@ -19,3 +19,6 @@ Desktop.ini
 # 임시 파일
 *.tmp
 *~
+
+.vercel
+.env*
